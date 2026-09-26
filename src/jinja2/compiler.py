@@ -903,11 +903,14 @@ class CodeGenerator(NodeVisitor):
                 self.writeline("yield from parent_template.root_render_func(context)")
             else:
                 self.writeline(
-                    "async for event in parent_template.root_render_func(context):"
+                    "async with aclosing(parent_template.root_render_func(context))"
+                    " as parent_event:"
                 )
                 self.indent()
+                self.writeline("async for event in parent_event:")
+                self.indent()
                 self.writeline("yield event")
-                self.outdent()
+                self.outdent(2)
             self.outdent(1 + (not self.has_known_extends))
 
         # at this point we now have the blocks collected and can visit them too.
@@ -977,14 +980,26 @@ class CodeGenerator(NodeVisitor):
                 f"yield from context.blocks[{node.name!r}][0]({context})", node
             )
         else:
-            self.writeline(
-                f"{self.choose_async()}for event in"
-                f" context.blocks[{node.name!r}][0]({context}):",
-                node,
-            )
+            if self.environment.is_async:
+                self.writeline(
+                    f"async with aclosing(context.blocks[{node.name!r}][0]({context}))"
+                    f" as block_event:",
+                    node,
+                )
+                self.indent()
+                self.writeline("async for event in block_event:")
+            else:
+                self.writeline(
+                    f"for event in"
+                    f" context.blocks[{node.name!r}][0]({context}):",
+                    node,
+                )
             self.indent()
             self.simple_write("event", frame)
-            self.outdent()
+            if self.environment.is_async:
+                self.outdent(2)
+            else:
+                self.outdent()
 
         self.outdent(level)
 
@@ -1059,11 +1074,22 @@ class CodeGenerator(NodeVisitor):
 
         skip_event_yield = False
         if node.with_context:
-            self.writeline(
-                f"{self.choose_async()}for event in template.root_render_func("
-                "template.new_context(context.get_all(), True,"
-                f" {self.dump_local_context(frame)})):"
-            )
+            if self.environment.is_async:
+                self.writeline(
+                    "async with aclosing(template.root_render_func("
+                    "template.new_context(context.get_all(), True,"
+                    f" {self.dump_local_context(frame)}))) as included_event:",
+                    node,
+                )
+                self.indent()
+                self.writeline("async for event in included_event:")
+            else:
+                self.writeline(
+                    "for event in template.root_render_func("
+                    "template.new_context(context.get_all(), True,"
+                    f" {self.dump_local_context(frame)})):",
+                    node,
+                )
         elif self.environment.is_async:
             self.writeline(
                 "for event in (await template._get_default_module_async())"
@@ -1076,7 +1102,10 @@ class CodeGenerator(NodeVisitor):
         if not skip_event_yield:
             self.indent()
             self.simple_write("event", frame)
-            self.outdent()
+            if self.environment.is_async and node.with_context:
+                self.outdent(2)
+            else:
+                self.outdent()
 
         if node.ignore_missing:
             self.outdent()
@@ -1187,11 +1216,16 @@ class CodeGenerator(NodeVisitor):
             self.writeline(f"{self.func(loop_filter_func)}(fiter):", node.test)
             self.indent()
             self.enter_frame(test_frame)
-            self.writeline(self.choose_async("async for ", "for "))
-            self.visit(node.target, loop_frame)
-            self.write(" in ")
-            self.write(self.choose_async("auto_aiter(fiter)", "fiter"))
-            self.write(":")
+            if self.environment.is_async:
+                self.writeline("async with aclosing(auto_aiter(fiter)) as fiter:")
+                self.indent()
+                self.writeline("async for ", node.test)
+                self.visit(node.target, loop_frame)
+                self.write(" in fiter:")
+            else:
+                self.writeline("for ", node.test)
+                self.visit(node.target, loop_frame)
+                self.write(" in fiter:")
             self.indent()
             self.writeline("if ", node.test)
             self.visit(node.test, test_frame)
@@ -1199,7 +1233,7 @@ class CodeGenerator(NodeVisitor):
             self.indent()
             self.writeline("yield ")
             self.visit(node.target, loop_frame)
-            self.outdent(3)
+            self.outdent(4 if self.environment.is_async else 3)
             self.leave_frame(test_frame, with_python_scope=True)
 
         # if we don't have an recursive loop we have to find the shadowed
@@ -1231,30 +1265,60 @@ class CodeGenerator(NodeVisitor):
             iteration_indicator = self.temporary_identifier()
             self.writeline(f"{iteration_indicator} = 1")
 
-        self.writeline(self.choose_async("async for ", "for "), node)
-        self.visit(node.target, loop_frame)
-        if extended_loop:
-            self.write(f", {loop_ref} in {self.choose_async('Async')}LoopContext(")
-        else:
-            self.write(" in ")
-
-        if node.test:
-            self.write(f"{loop_filter_func}(")
-        if node.recursive:
-            self.write("reciter")
-        else:
-            if self.environment.is_async and not extended_loop:
-                self.write("auto_aiter(")
-            self.visit(node.iter, frame)
-            if self.environment.is_async and not extended_loop:
+        if self.environment.is_async:
+            # The iterator of an ``async for`` is not closed when the
+            # loop (or the generator containing it) is abandoned, so wrap
+            # it in an ``aclosing`` block.  The whole iterated object is
+            # evaluated once into a temporary variable first.
+            loop_iterator = self.temporary_identifier()
+            self.writeline(f"{loop_iterator} = ", node)
+            if extended_loop:
+                self.write("AsyncLoopContext(")
+            if node.test:
+                self.write(f"{loop_filter_func}(")
+            if node.recursive:
+                self.write("reciter")
+            else:
+                if not extended_loop:
+                    self.write("auto_aiter(")
+                self.visit(node.iter, frame)
+                if not extended_loop:
+                    self.write(")")
+            if node.test:
                 self.write(")")
-        if node.test:
-            self.write(")")
-
-        if node.recursive:
-            self.write(", undefined, loop_render_func, depth):")
+            if node.recursive:
+                self.write(", undefined, loop_render_func, depth)")
+            elif extended_loop:
+                self.write(", undefined)")
+            self.newline()
+            self.writeline(f"async with aclosing({loop_iterator}) as {loop_iterator}:")
+            self.indent()
+            self.writeline("async for ", node)
+            self.visit(node.target, loop_frame)
+            if extended_loop:
+                self.write(f", {loop_ref}")
+            self.write(f" in {loop_iterator}:")
         else:
-            self.write(", undefined):" if extended_loop else ":")
+            self.writeline("for ", node)
+            self.visit(node.target, loop_frame)
+            if extended_loop:
+                self.write(f", {loop_ref} in LoopContext(")
+            else:
+                self.write(" in ")
+
+            if node.test:
+                self.write(f"{loop_filter_func}(")
+            if node.recursive:
+                self.write("reciter")
+            else:
+                self.visit(node.iter, frame)
+            if node.test:
+                self.write(")")
+
+            if node.recursive:
+                self.write(", undefined, loop_render_func, depth):")
+            else:
+                self.write(", undefined):" if extended_loop else ":")
 
         self.indent()
         self.enter_frame(loop_frame)
@@ -1274,6 +1338,11 @@ class CodeGenerator(NodeVisitor):
             self.enter_frame(else_frame)
             self.blockvisit(node.else_, else_frame)
             self.leave_frame(else_frame)
+            self.outdent()
+
+        if self.environment.is_async:
+            # Close the ``async with aclosing(...)`` block holding the
+            # loop iterator.
             self.outdent()
 
         # if the node was recursive we have to return the buffer contents

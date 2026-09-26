@@ -15,6 +15,7 @@ from types import CodeType
 from markupsafe import Markup
 
 from . import nodes
+from .async_utils import aclosing
 from .compiler import CodeGenerator
 from .compiler import generate
 from .defaults import BLOCK_END_STRING
@@ -1308,9 +1309,8 @@ class Template:
         ctx = self.new_context(dict(*args, **kwargs))
 
         try:
-            return self.environment.concat(  # type: ignore
-                [n async for n in self.root_render_func(ctx)]  # type: ignore
-            )
+            async with aclosing(self.root_render_func(ctx)) as gen:  # type: ignore
+                return self.environment.concat([n async for n in gen])
         except Exception:
             return self.environment.handle_exception()
 
@@ -1358,8 +1358,9 @@ class Template:
         ctx = self.new_context(dict(*args, **kwargs))
 
         try:
-            async for event in self.root_render_func(ctx):  # type: ignore
-                yield event
+            async with aclosing(self.root_render_func(ctx)) as gen:  # type: ignore
+                async for event in gen:
+                    yield event
         except Exception:
             yield self.environment.handle_exception()
 
@@ -1407,11 +1408,9 @@ class Template:
         becomes unavailable in async mode.
         """
         ctx = self.new_context(vars, shared, locals)
-        return TemplateModule(
-            self,
-            ctx,
-            [x async for x in self.root_render_func(ctx)],  # type: ignore
-        )
+        async with aclosing(self.root_render_func(ctx)) as gen:  # type: ignore
+            body = [x async for x in gen]
+        return TemplateModule(self, ctx, body)
 
     @internalcode
     def _get_default_module(self, ctx: t.Optional[Context] = None) -> "TemplateModule":

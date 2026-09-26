@@ -13,6 +13,7 @@ from markupsafe import escape
 from markupsafe import Markup
 from markupsafe import soft_str
 
+from .async_utils import aclosing
 from .async_utils import async_variant
 from .async_utils import auto_aiter
 from .async_utils import auto_await
@@ -651,10 +652,11 @@ def sync_do_first(
 async def do_first(
     environment: "Environment", seq: "t.Union[t.AsyncIterable[V], t.Iterable[V]]"
 ) -> "t.Union[V, Undefined]":
-    try:
-        return await auto_aiter(seq).__anext__()
-    except StopAsyncIteration:
-        return environment.undefined("No first item, sequence was empty.")
+    async with aclosing(auto_aiter(seq)) as seq_iter:
+        try:
+            return await seq_iter.__anext__()
+        except StopAsyncIteration:
+            return environment.undefined("No first item, sequence was empty.")
 
 
 @pass_environment
@@ -1339,8 +1341,9 @@ async def do_sum(
         def func(x: V) -> V:
             return x
 
-    async for item in auto_aiter(iterable):
-        rv += func(item)
+    async with aclosing(auto_aiter(iterable)) as it:
+        async for item in it:
+            rv += func(item)
 
     return rv
 
@@ -1526,8 +1529,9 @@ async def do_map(
     if value:
         func = prepare_map(context, args, kwargs)
 
-        async for item in auto_aiter(value):
-            yield await auto_await(func(item))
+        async with aclosing(auto_aiter(value)) as it:
+            async for item in it:
+                yield await auto_await(func(item))
 
 
 @pass_context
@@ -1803,9 +1807,10 @@ async def async_select_or_reject(
     if value:
         func = prepare_select_or_reject(context, args, kwargs, modfunc, lookup_attr)
 
-        async for item in auto_aiter(value):
-            if func(item):
-                yield item
+        async with aclosing(auto_aiter(value)) as it:
+            async for item in it:
+                if func(item):
+                    yield item
 
 
 FILTERS = {

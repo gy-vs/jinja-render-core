@@ -67,12 +67,36 @@ async def auto_await(value: t.Union[t.Awaitable["V"], "V"]) -> "V":
     return t.cast("V", value)
 
 
+class aclosing:
+    """Async context manager that calls :meth:`aclose` on the async
+    iterator when the block is exited for any reason.
+
+    Equivalent to :func:`contextlib.aclosing`, which is only available
+    in Python 3.10.  Keeping a copy here allows supporting Python 3.7.
+    """
+
+    def __init__(self, thing: "t.AsyncIterator[t.Any]") -> None:
+        self.thing = thing
+
+    async def __aenter__(self) -> "t.AsyncIterator[t.Any]":
+        return self.thing
+
+    async def __aexit__(self, *exc_info: t.Any) -> None:
+        await self.thing.aclose()
+
+
 async def auto_aiter(
     iterable: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
 ) -> "t.AsyncIterator[V]":
     if hasattr(iterable, "__aiter__"):
-        async for item in t.cast("t.AsyncIterable[V]", iterable):
-            yield item
+        # The async iterable owns its own resources, so close its
+        # iterator if iteration is abandoned early.  Plain sync
+        # iterables do not have an ``aclose`` method.
+        iterator = t.cast("t.AsyncIterator[V]", iterable.__aiter__())
+
+        async with aclosing(iterator):
+            async for item in iterator:
+                yield item
     else:
         for item in iterable:
             yield item
@@ -81,4 +105,5 @@ async def auto_aiter(
 async def auto_to_list(
     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
 ) -> t.List["V"]:
-    return [x async for x in auto_aiter(value)]
+    async with aclosing(auto_aiter(value)) as it:
+        return [x async for x in it]

@@ -10,6 +10,7 @@ from markupsafe import escape  # noqa: F401
 from markupsafe import Markup
 from markupsafe import soft_str
 
+from .async_utils import aclosing
 from .async_utils import auto_aiter
 from .async_utils import auto_await  # noqa: F401
 from .exceptions import TemplateNotFound  # noqa: F401
@@ -62,6 +63,7 @@ exported = [
 ]
 async_exported = [
     "AsyncLoopContext",
+    "aclosing",
     "auto_aiter",
     "auto_await",
 ]
@@ -367,9 +369,8 @@ class BlockReference:
 
     @internalcode
     async def _async_call(self) -> str:
-        rv = concat(
-            [x async for x in self._stack[self._depth](self._context)]  # type: ignore
-        )
+        async with aclosing(self._stack[self._depth](self._context)) as gen:  # type: ignore
+            rv = concat([x async for x in gen])
 
         if self._context.eval_ctx.autoescape:
             return Markup(rv)
@@ -603,7 +604,9 @@ class AsyncLoopContext(LoopContext):
         try:
             self._length = len(self._iterable)  # type: ignore
         except TypeError:
-            iterable = [x async for x in self._iterator]
+            old_iterator = self._iterator
+            async with aclosing(old_iterator):
+                iterable = [x async for x in old_iterator]
             self._iterator = self._to_iterator(iterable)
             self._length = len(iterable) + self.index + (self._after is not missing)
 
@@ -655,6 +658,16 @@ class AsyncLoopContext(LoopContext):
         self._before = self._current
         self._current = rv
         return rv, self
+
+    async def aclose(self) -> None:
+        """Close the wrapped async iterator.
+
+        Called when a ``for`` loop that iterates this context is
+        abandoned (for example because the surrounding render is closed
+        with ``aclose``), so that resources held by the iterated object
+        are released without waiting for garbage collection.
+        """
+        await self._iterator.aclose()
 
 
 class Macro:

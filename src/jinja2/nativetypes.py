@@ -6,6 +6,7 @@ from itertools import islice
 from types import GeneratorType
 
 from . import nodes
+from .async_utils import aclosing
 from .compiler import CodeGenerator
 from .compiler import Frame
 from .compiler import has_safe_repr
@@ -120,9 +121,9 @@ class NativeTemplate(Template):
         ctx = self.new_context(dict(*args, **kwargs))
 
         try:
-            return self.environment_class.concat(  # type: ignore
-                [n async for n in self.root_render_func(ctx)]  # type: ignore
-            )
+            async with aclosing(self.root_render_func(ctx)) as gen:  # type: ignore
+                result = [n async for n in gen]
+            return self.environment_class.concat(result)  # type: ignore
         except Exception:
             return self.environment.handle_exception()
 

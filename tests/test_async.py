@@ -1,4 +1,7 @@
 import asyncio
+import gc
+import sys
+import warnings
 
 import pytest
 
@@ -6,6 +9,7 @@ from jinja2 import ChainableUndefined
 from jinja2 import DictLoader
 from jinja2 import Environment
 from jinja2 import Template
+from jinja2.async_utils import aclosing
 from jinja2.async_utils import auto_aiter
 from jinja2.exceptions import TemplateNotFound
 from jinja2.exceptions import TemplatesNotFound
@@ -658,3 +662,311 @@ def test_getitem_after_call():
     t = env.from_string("{{ add_each(a, 2)[1:] }}")
     out = t.render(a=range(3))
     assert out == "[3, 4]"
+
+
+# ---------------------------------------------------------------------------
+# Closing async generators when streaming output is abandoned.
+#
+# When a caller does ``gen.aclose()`` on the result of
+# ``Template.generate_async`` (for example because an HTTP client
+# disconnected), every async generator created by the render -- the
+# template ``root`` functions, ``block_`` functions, the ``auto_aiter``
+# wrappers and async iterators passed in by the caller -- must be closed
+# immediately.  They must not survive until garbage collection, which
+# triggers ``ResourceWarning`` under runtimes such as trio.
+# ---------------------------------------------------------------------------
+
+
+class _gc_finalized_recorder:
+    """Context manager that records async generators finalized through
+    the garbage collector (via the ``sys.set_asyncgen_hooks`` finalizer)
+    instead of being explicitly closed."""
+
+    def __init__(self):
+        self.names = []
+
+    def __enter__(self):
+        self._old = sys.get_asyncgen_hooks()
+        sys.set_asyncgen_hooks(finalizer=self._finalizer)
+        return self
+
+    def __exit__(self, *exc):
+        firstiter, finalizer = self._old
+        sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=finalizer)
+        return False
+
+    def _finalizer(self, agen, *args):
+        self.names.append(agen.ag_code.co_name)
+
+
+async def _async_items():
+    yield 1
+    yield 2
+    yield 3
+
+
+def _sync_generator_items():
+    yield from (1, 2, 3)
+
+
+def _recursive_items():
+    return [
+        {"v": 1, "c": [{"v": 2, "c": []}]},
+        {"v": 3, "c": []},
+    ]
+
+
+_CLOSE_LOADER = DictLoader(
+    {
+        "simple.html": "{% for x in items %}[{{ x }}]{% endfor %}",
+        "list.html": "{% for x in [1, 2, 3] %}[{{ x }}]{% endfor %}",
+        "filter.html": "{% for x in items if x > 1 %}[{{ x }}]{% endfor %}",
+        "extended.html": "{% for x in items %}[{{ loop.index }}:{{ x }}]{% endfor %}",
+        "else.html": "{% for x in items %}[{{ x }}]{% else %}none{% endfor %}",
+        "recursive.html": (
+            "{% for item in items recursive %}"
+            "({{ item.v }}{{ loop(item.c) }}){% endfor %}"
+        ),
+        "nested.html": (
+            "{% for row in rows %}"
+            "{% for y in row %}[{{ y }}]{% endfor %}|{% endfor %}"
+        ),
+        "include.html": '{% include "included.html" %}tail',
+        "included.html": "[included]",
+        "base.html": "{% block body %}[base]{% endblock %}tail",
+        "extends.html": (
+            '{% extends "base.html" %}{% block body %}[child]{% endblock %}'
+        ),
+        "self.html": "{% block foo %}[foo]{% endblock %}{{ self.foo() }}tail",
+        "first.html": "{{ items|first }}tail",
+        "map.html": "{% for x in items|map('string') %}{{ x }}{% endfor %}",
+        "select.html": "{% for x in items|select('odd') %}{{ x }}{% endfor %}",
+        "sum.html": "{{ items|sum }}tail",
+    }
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "context_factory"),
+    [
+        ("list.html", None),
+        ("simple.html", lambda: {"items": _async_items()}),
+        ("simple.html", lambda: {"items": _sync_generator_items()}),
+        ("filter.html", lambda: {"items": _async_items()}),
+        ("extended.html", lambda: {"items": _async_items()}),
+        ("else.html", lambda: {"items": _async_items()}),
+        ("recursive.html", lambda: {"items": _recursive_items()}),
+        (
+            "nested.html",
+            lambda: {"rows": [_async_items(), _async_items()]},
+        ),
+        ("include.html", None),
+        ("extends.html", None),
+        ("self.html", None),
+        ("first.html", lambda: {"items": _async_items()}),
+        ("map.html", lambda: {"items": _async_items()}),
+        ("select.html", lambda: {"items": _async_items()}),
+        ("sum.html", lambda: {"items": _async_items()}),
+    ],
+)
+def test_generate_async_aclose_does_not_leak_generators(name, context_factory):
+    async def run():
+        env = Environment(enable_async=True, loader=_CLOSE_LOADER)
+        context = context_factory() if context_factory is not None else {}
+        recorder = _gc_finalized_recorder()
+        with recorder:
+            gen = env.get_template(name).generate_async(**context)
+            await gen.__anext__()
+            await gen.aclose()
+
+            # Give garbage collection every chance to surface a leak.
+            for _ in range(2):
+                gc.collect()
+                await asyncio.sleep(0)
+
+        assert recorder.names == [], recorder.names
+
+    asyncio.run(run())
+
+
+def test_aclose_without_anext_does_not_leak():
+    async def run():
+        env = Environment(enable_async=True, loader=_CLOSE_LOADER)
+        recorder = _gc_finalized_recorder()
+        with recorder:
+            gen = env.get_template("simple.html").generate_async(items=_async_items())
+            await gen.aclose()
+            gc.collect()
+            await asyncio.sleep(0)
+            gc.collect()
+        assert recorder.names == [], recorder.names
+
+    asyncio.run(run())
+
+
+def test_aclose_runs_iterable_finalizer_immediately():
+    closed = []
+
+    async def guarded_items():
+        try:
+            yield 1
+            yield 2
+        finally:
+            closed.append("closed")
+
+    async def run():
+        env = Environment(enable_async=True, loader=_CLOSE_LOADER)
+        with _gc_finalized_recorder() as recorder:
+            gen = env.get_template("simple.html").generate_async(
+                items=guarded_items()
+            )
+            await gen.__anext__()
+            await gen.aclose()
+            gc.collect()
+            await asyncio.sleep(0)
+        assert closed == ["closed"]
+        assert recorder.names == []
+
+    asyncio.run(run())
+
+
+def test_template_exception_still_closes_iterable():
+    closed = []
+
+    async def guarded_items():
+        try:
+            for x in range(5):
+                yield x
+        finally:
+            closed.append("closed")
+
+    async def run():
+        env = Environment(enable_async=True)
+        t = env.from_string(
+            "{% for x in items %}{% if x == 2 %}{{ 1 / 0 }}"
+            "{% endif %}[{{ x }}]{% endfor %}"
+        )
+        with _gc_finalized_recorder() as recorder:
+            with pytest.raises(ZeroDivisionError):
+                await t.render_async(items=guarded_items())
+            gc.collect()
+            await asyncio.sleep(0)
+        assert closed == ["closed"]
+        assert recorder.names == []
+
+    asyncio.run(run())
+
+
+def test_no_resource_warning_on_aclose():
+    async def run():
+        env = Environment(enable_async=True, loader=_CLOSE_LOADER)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ResourceWarning)
+            gen = env.get_template("simple.html").generate_async(items=_async_items())
+            await gen.__anext__()
+            await gen.aclose()
+            gc.collect()
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_full_renders_unchanged():
+    expected = {
+        "list.html": "[1][2][3]",
+        "simple.html": "[1][2][3]",
+        "filter.html": "[2][3]",
+        "extended.html": "[1:1][2:2][3:3]",
+        "else.html": "[1][2][3]",
+        "recursive.html": "(1(2))(3)",
+        "nested.html": "[1][2][3]|[1][2][3]|",
+        "include.html": "[included]tail",
+        "extends.html": "[child]tail",
+        "self.html": "[foo][foo]tail",
+        "first.html": "1tail",
+        "map.html": "123",
+        "select.html": "13",
+        "sum.html": "6tail",
+    }
+
+    async def run():
+        env = Environment(enable_async=True, loader=_CLOSE_LOADER)
+        contexts = {
+            "simple.html": {"items": [1, 2, 3]},
+            "filter.html": {"items": [1, 2, 3]},
+            "extended.html": {"items": [1, 2, 3]},
+            "else.html": {"items": [1, 2, 3]},
+            "recursive.html": {"items": _recursive_items()},
+            "nested.html": {"rows": [[1, 2, 3], [1, 2, 3]]},
+            "first.html": {"items": [1, 2, 3]},
+            "map.html": {"items": [1, 2, 3]},
+            "select.html": {"items": [1, 2, 3, 4]},
+            "sum.html": {"items": [1, 2, 3]},
+        }
+        for name, want in expected.items():
+            t = env.get_template(name)
+            parts = []
+            async for event in t.generate_async(**contexts.get(name, {})):
+                parts.append(event)
+            assert "".join(parts) == want, name
+
+    asyncio.run(run())
+
+
+def test_aclosing_context_manager():
+    closed = []
+
+    async def gen():
+        try:
+            yield 1
+            yield 2
+        finally:
+            closed.append("closed")
+
+    async def run_normal():
+        async with aclosing(gen()) as g:
+            assert await g.__anext__() == 1
+
+    asyncio.run(run_normal())
+    assert closed == ["closed"]
+
+    async def run_error():
+        with pytest.raises(ValueError):
+            async with aclosing(gen()) as g:
+                await g.__anext__()
+                raise ValueError("boom")
+
+    del closed[:]
+    asyncio.run(run_error())
+    assert closed == ["closed"]
+
+
+def test_auto_aiter_closes_wrapped_async_iterator():
+    closed = []
+
+    async def source():
+        try:
+            yield "a"
+            yield "b"
+        finally:
+            closed.append("closed")
+
+    async def run():
+        wrapper = auto_aiter(source())
+        assert await wrapper.__anext__() == "a"
+        await wrapper.aclose()
+
+    asyncio.run(run())
+    assert closed == ["closed"]
+
+
+def test_auto_aiter_leaves_sync_iterables_working():
+    async def run():
+        result = []
+        async with aclosing(auto_aiter([1, 2, 3])) as g:
+            async for x in g:
+                result.append(x)
+        return result
+
+    assert asyncio.run(run()) == [1, 2, 3]
+

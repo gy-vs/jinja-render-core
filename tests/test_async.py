@@ -1,4 +1,9 @@
 import asyncio
+import contextlib
+import gc
+import sys
+import traceback
+import warnings
 
 import pytest
 
@@ -658,3 +663,182 @@ def test_getitem_after_call():
     t = env.from_string("{{ add_each(a, 2)[1:] }}")
     out = t.render(a=range(3))
     assert out == "[3, 4]"
+
+
+@contextlib.contextmanager
+def _track_gc_finalized_async_gens():
+    """Track async generators that are garbage collected without being
+    exhausted. An async generator that is closed explicitly never reaches
+    the finalizer hook, so anything recorded here was cleaned up by the
+    garbage collector instead of deterministically.
+    """
+    finalized = []
+    old_hooks = sys.get_asyncgen_hooks()
+    sys.set_asyncgen_hooks(lambda agen: None, finalized.append)
+    try:
+        yield finalized
+    finally:
+        sys.set_asyncgen_hooks(*old_hooks)
+
+
+def _run_tracked(async_fn, *args):
+    """Run ``async_fn`` with ``asyncio.run`` and return the async generators
+    that had to be finalized by the garbage collector.
+
+    The hooks are installed inside the coroutine because the event loop
+    replaces them with its own when it starts running.
+    """
+
+    async def runner():
+        with _track_gc_finalized_async_gens() as finalized:
+            await async_fn(*args)
+            gc.collect()
+        return finalized
+
+    return asyncio.run(runner())
+
+
+class _AsyncIterable:
+    """An async iterable that doesn't create async generators itself."""
+
+    def __init__(self, items):
+        self._iterator = iter(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class TestGenerateAsyncClose:
+    """Closing the generator returned by ``generate_async`` must close all
+    async generators created for the render, rather than leaving them to
+    the garbage collector.
+    """
+
+    @pytest.fixture
+    def close_env(self):
+        return Environment(
+            loader=DictLoader(
+                {
+                    "b": "included",
+                    "p": "P[{% block c %}default{% endblock %}]",
+                    "l1": 'B{% include "l2" %}Y',
+                    "l2": "C{% for x in [1, 2, 3] %}{{ x }}{% endfor %}D",
+                }
+            ),
+            enable_async=True,
+        )
+
+    @pytest.mark.parametrize(
+        "source, first, full",
+        [
+            ("{% for x in [1, 2, 3] %}[{{ x }}]{% endfor %}", "[", "[1][2][3]"),
+            ('{% include "b" %} tail', "included", "included tail"),
+            ('{% extends "p" %}{% block c %}C{% endblock %}', "P[", "P[C]"),
+            ("{% block a %}A{% endblock %}{{ self.a() }}", "A", "AA"),
+            ('{% include "l1" %}', "B", "BC123DY"),
+        ],
+    )
+    def test_aclose_closes_render_generators(self, close_env, source, first, full):
+        t = close_env.from_string(source)
+
+        async def run():
+            # Rendering to completion is unaffected.
+            assert await t.render_async() == full
+
+            agen = t.generate_async()
+            assert await agen.__anext__() == first
+            await agen.aclose()
+
+        assert _run_tracked(run) == []
+
+    def test_aclose_closes_loop_over_async_iterable(self, close_env):
+        t = close_env.from_string("{% for x in seq %}[{{ x }}]{% endfor %}")
+
+        async def run():
+            assert await t.render_async(seq=_AsyncIterable([1, 2, 3])) == "[1][2][3]"
+
+            agen = t.generate_async(seq=_AsyncIterable([1, 2, 3]))
+            assert await agen.__anext__() == "["
+            await agen.aclose()
+
+        assert _run_tracked(run) == []
+
+    def test_first_filter_over_async_iterable(self, close_env):
+        t = close_env.from_string("{{ seq|first }}")
+
+        async def run():
+            assert await t.render_async(seq=_AsyncIterable([1, 2, 3])) == "1"
+
+        assert _run_tracked(run) == []
+
+    def test_exception_traceback_points_to_template(self, close_env):
+        t = close_env.from_string("line\n{{ x / 0 }}")
+
+        async def run():
+            try:
+                async for _ in t.generate_async(x=1):
+                    pass
+            except ZeroDivisionError:
+                tb = traceback.format_exc()
+            else:
+                pytest.fail("expected ZeroDivisionError")
+
+            assert 'File "<template>", line 2' in tb
+
+        asyncio.run(run())
+
+    def test_exception_in_include_traceback(self, close_env):
+        # DictLoader templates all share the "<template>" filename, so use
+        # distinct line numbers to identify each frame. The include is on
+        # line 2 of the outer template, the error on line 3 of "broken".
+        close_env.loader.mapping["broken"] = "line\nline\n{{ x / 0 }}"
+        t = close_env.from_string('{% set x = 1 %}\n{% include "broken" %}')
+
+        async def run():
+            try:
+                async for _ in t.generate_async():
+                    pass
+            except ZeroDivisionError:
+                tb = traceback.format_exc()
+            else:
+                pytest.fail("expected ZeroDivisionError")
+
+            assert 'File "<template>", line 2' in tb
+            assert 'File "<template>", line 3' in tb
+
+        asyncio.run(run())
+
+    def test_aclose_no_resource_warning_trio(self, close_env):
+        """trio doesn't install an asyncio-style finalizer, so any async
+        generator left to the garbage collector produces a ResourceWarning.
+        """
+        trio = pytest.importorskip("trio")
+
+        sources = [
+            "{% for x in [1, 2, 3] %}[{{ x }}]{% endfor %}",
+            '{% include "b" %} tail',
+            '{% extends "p" %}{% block c %}C{% endblock %}',
+            "{% block a %}A{% endblock %}{{ self.a() }}",
+        ]
+
+        async def run(source):
+            agen = close_env.from_string(source).generate_async()
+            await agen.__anext__()
+            await agen.aclose()
+
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            for source in sources:
+                trio.run(run, source)
+            gc.collect()
+
+        resource_warnings = [
+            w for w in records if issubclass(w.category, ResourceWarning)
+        ]
+        assert resource_warnings == []
